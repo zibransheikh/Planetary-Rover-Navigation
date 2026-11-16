@@ -1,0 +1,84 @@
+{
+  "obs_mode": "onboard",
+  "episodes_per_split": 200,
+  "trajectory_sha256": "15544bfaf9c05a861c787857ad3b9731b1df2657c42cef902f46d91c3ec2d206",
+  "reproduced_identically_on_second_run": true,
+  "results": {
+    "random/val": {
+      "episodes": 200,
+      "success_rate": 0.01,
+      "success_ci95": [
+        0.0027466006037749346,
+        0.03572248519617954
+      ],
+      "reasons": {
+        "goal": 2,
+        "battery_depleted": 198,
+        "timeout": 0
+      },
+      "mean_battery_left": 0.14,
+      "mean_battery_left_success": 14.0,
+      "mean_steps": 59.11,
+      "collisions_per_episode": 15.315,
+      "mean_energy_ratio_success": 4.3,
+      "min_battery_seen": 0
+    },
+    "greedy_local/val": {
+      "episodes": 200,
+      "success_rate": 0.525,
+      "success_ci95": [
+        0.45597270710507,
+        0.5930849925990139
+      ],
+      "reasons": {
+        "goal": 105,
+        "battery_depleted": 95,
+        "timeout": 0
+      },
+      "mean_battery_left": 37.03,
+      "mean_battery_left_success": 70.53333333333333,
+      "mean_steps": 42.805,
+      "collisions_per_episode": 0.0,
+      "mean_energy_ratio_success": 1.2755259290973575,
+      "min_battery_seen": 0
+    },
+    "random/test": {
+      "episodes": 200,
+      "success_rate": 0.0,
+      "success_ci95": [
+        0.0,
+        0.018846005918320894
+      ],
+      "reasons": {
+        "goal": 0,
+        "battery_depleted": 200,
+        "timeout": 0
+      },
+      "mean_battery_left": 0.0,
+      "mean_battery_left_success": NaN,
+      "mean_steps": 60.87,
+      "collisions_per_episode": 15.93,
+      "mean_energy_ratio_success": NaN,
+      "min_battery_seen": 0
+    },
+    "greedy_local/test": {
+      "episodes": 200,
+      "success_rate": 0.57,
+      "success_ci95": [
+        0.500703604055383,
+        0.636657955116052
+      ],
+      "reasons": {
+        "goal": 114,
+        "battery_depleted": 86,
+        "timeout": 0
+      },
+      "mean_battery_left": 40.6,
+      "mean_battery_left_success": 71.2280701754386,
+      "mean_steps": 41.33,
+      "collisions_per_episode": 0.0,
+      "mean_energy_ratio_success": 1.253747349142086,
+      "min_battery_seen": 0
+    }
+  }
+}

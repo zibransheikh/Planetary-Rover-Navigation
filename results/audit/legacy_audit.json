@@ -1,0 +1,81 @@
+{
+  "maps": {
+    "n": 2000,
+    "unsolvable_after_200_retries": 0,
+    "unreachable_goal_hidden_by_fallback": 0,
+    "cost_exceeds_battery": 0
+  },
+  "accounting": {
+    "episodes": 600,
+    "reached_goal": 352,
+    "ended_with_negative_battery": 70,
+    "goal_reached_with_battery<=0": 0,
+    "goal_reached_but_not_counted_success_by_reward>=100_rule": 0
+  },
+  "bump": {
+    "boundary_bump_on_rock_battery_cost": 5,
+    "boundary_bump_reward": -0.15000000000000002,
+    "obstacle_collision_battery_cost": 1,
+    "obstacle_collision_reward": -2
+  },
+  "leak": {
+    "features_changed_by_terrain_outside_3x3": [
+      5,
+      6
+    ],
+    "interpretation": "indices 5 (cost_to_goal_ratio) and 6 (budget_margin) read the full hidden map"
+  },
+  "speed": {
+    "legacy_dijkstra_calls_per_step": 1.92,
+    "legacy_us_per_step": 347.4,
+    "audited_onboard_us_per_step": 7.5,
+    "speedup_x": 46.6
+  },
+  "seeding": {
+    "two_unseeded_envs_same_map": false,
+    "same_global_seed_same_map": true,
+    "note": "no seed argument or per-episode seed; map stream depends on global random state"
+  },
+  "static": {
+    "notebook_env_cell_uses_MarsGridGenerator_before_definition": true,
+    "notebook_cells_use_vs_define": [
+      1,
+      12
+    ],
+    "train_dqn.py_listed_in_README_but_missing": true,
+    "train_ppo.py_calls_item_on_python_float": true,
+    "dqn_steps_saved_as_constant_placeholder": true,
+    "success_defined_as_reward>=100": true,
+    "reported_success_is_training_time_epsilon_greedy": true
+  },
+  "saved_results": {
+    "dqn": {
+      "episodes": 1500,
+      "SR_first100": 0.36,
+      "SR_all": 0.7833333333333333,
+      "SR_last100": 0.88,
+      "battery_last100": 50.48,
+      "episodes_with_negative_battery": 92,
+      "min_battery": -4,
+      "episode_rolling_SR>=0.8": 160,
+      "steps_unique_values": 1,
+      "steps_mean": 100.0,
+      "notebook_logged_SR_last100": 0.87,
+      "pkl_matches_notebook_log": false
+    },
+    "ppo": {
+      "episodes": 1500,
+      "SR_first100": 0.0,
+      "SR_all": 0.504,
+      "SR_last100": 0.91,
+      "battery_last100": 37.83,
+      "episodes_with_negative_battery": 250,
+      "min_battery": -4,
+      "episode_rolling_SR>=0.8": 1108,
+      "steps_unique_values": 83,
+      "steps_mean": 53.62266666666667,
+      "notebook_logged_SR_last100": 0.81,
+      "pkl_matches_notebook_log": false
+    }
+  }
+}

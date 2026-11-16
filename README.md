@@ -1,265 +1,33 @@
-# Battery-Aware Mars Rover Navigation using DQN vs PPO
+# planetary-rover-marec — Phase 1 / Task 1 baseline
 
-# Repository Structure
-
-```
-Battery-Aware-Mars-Rover-DQN-vs-PPO/
-│
-├── rover_env.py                # Battery-aware Mars environment
-├── dqn_agent.py                # DQN implementation
-├── ppo_agent.py                # PPO implementation
-├── train_dqn.py                # DQN training script
-├── train_ppo.py                # PPO training script
-│
-├── dqn_results.pkl             # DQN training metrics
-├── ppo_results.pkl             # PPO training metrics
-│
-├── compare_reward.png
-├── compare_steps.png
-├── compare_success_rate.png
-├── compare_battery.png
-├── compare_budget_margin.png
-├── DQN_vs_PPO_Overlapping.png
-│
-├── Battery_Aware_Rover.png     # environment visualization
-├── PPO_Training_Results.png
-│
-├── DQN_PPO_Agents.ipynb        # full notebook
-└── README.md
-```
-
-## Overview
-
-This project implements a **battery-aware autonomous Mars rover navigation system** using **Deep Reinforcement Learning**. The rover must reach a goal location in a grid-based Martian terrain while **optimizing battery consumption**, **avoiding obstacles**, and **handling difficult terrain** such as sand and rocks.
-
-Two reinforcement learning algorithms are compared:
-
-* Deep Q-Network (DQN)
-* Proximal Policy Optimization (PPO)
-
-The objective is to evaluate which algorithm performs better in **battery-aware autonomous navigation**.
-
----
-
-# Problem Statement
-
-Autonomous planetary rovers operate in harsh environments with:
-
-* Limited battery capacity
-* Unknown terrain difficulty
-* Obstacles blocking shortest paths
-* Energy-consuming terrain (sand, rocks)
-* Need for efficient navigation
-
-Traditional path planning methods like A* do not consider **battery-aware learning behavior** in dynamic environments.
-
-### Goal
-
-Train a reinforcement learning rover that:
-
-* Reaches destination successfully
-* Minimizes battery consumption
-* Avoids obstacles
-* Learns terrain-aware routing
-* Maximizes reward
-
----
-
-# Solution Approach
-
-We compare two RL agents:
-
-### DQN Agent
-
-* Value-based method
-* Learns Q-values
-* Uses replay buffer
-* ε-greedy exploration
-* Stable but slower learning
-
-### PPO Agent
-
-* Policy-gradient method
-* Actor-Critic architecture
-* Clipped objective
-* More stable updates
-* Better exploration
-
----
-
-
-# Environment Description
-
-Grid-based Mars terrain contains:
-
-| Terrain Type | Value | Energy Cost |
-| ------------ | ----- | ----------- |
-| Normal       | 0     | 1           |
-| Sand         | 1     | 3           |
-| Rock         | 2     | 5           |
-| Obstacle     | 3     | Blocked     |
-
-State includes:
-
-* Rover X position
-* Rover Y position
-* Remaining battery
-* Distance to goal
-* Local terrain info
-* Budget margin
-* Battery percentage
-
----
-
-
-# DQN Solution Flowchart
-```mermaid
-flowchart TD
-    A[Start] --> B[Initialize Environment]
-    B --> C[Initialize DQN Network]
-    C --> D[Reset Environment]
-    D --> E[Get State]
-    E --> F[Select Action epsilon-greedy]
-    F --> G[Execute Action]
-    G --> H[Receive Reward and Next State]
-    H --> I[Store in Replay Buffer]
-    I --> J[Sample Mini Batch]
-    J --> K[Compute Q Target]
-    K --> L[Update DQN Network]
-    L --> M[Update Target Network]
-    M --> N{Episode Done?}
-    N -->|No| E
-    N -->|Yes| O[Log Metrics]
-    O --> P[Next Episode]
-    P --> D
-```
----
-
-# PPO Solution Flowchart
-
-```mermaid 
-flowchart TD
-    A[Start] --> B[Initialize Environment]
-    B --> C[Initialize Actor Network]
-    C --> D[Initialize Critic Network]
-    D --> E[Reset Environment]
-    E --> F[Collect Trajectory]
-    F --> G[Store States Actions Rewards]
-    G --> H[Compute Advantages GAE]
-    H --> I[Compute PPO Loss]
-    I --> J[Clip Policy Ratio]
-    J --> K[Update Actor Network]
-    K --> L[Update Critic Network]
-    L --> M{Episode Done?}
-    M -->|No| F
-    M -->|Yes| N[Log Metrics]
-    N --> O[Next Episode]
-    O --> E
-```
-
----
-
-# Reward Design
-
-The rover receives:
-
-### Positive Rewards
-
-* Reaching goal
-* Efficient battery usage
-* Moving toward goal
-
-### Negative Rewards
-
-* Collision with obstacle
-* Battery depletion
-* Moving away from goal
-* High terrain energy cost
-
----
-
-
----
-
-# Training Metrics Compared
-
-The following metrics are evaluated:
-
-* Total Reward
-* Success Rate
-* Battery Remaining
-* Steps Taken
-* Budget Margin
-* Convergence Speed
-
----
-
-# Results Summary
-
-PPO typically shows:
-
-* Faster convergence
-* Higher success rate
-* Better battery management
-* Smoother policy learning
-
-DQN typically shows:
-
-* Stable learning
-* Slower convergence
-* Slightly lower exploration
-
----
-
-# How to Run
-
-### Train DQN
+Audited, reproducible starting point for *Uncertainty-Gated Runtime Assurance for Learning-Based Planetary Rover Navigation* (MAREC).
+Read **`docs/AUDIT_NOTES.md`** first, then **`docs/OBSERVATION_SCHEMA.md`**.
 
 ```
-python train_dqn.py
+configs/      YAML: three reference configs (onboard, onboard+shaping, legacy17)
+src/
+  environment/  rover_env.py (policy-facing), terrain.py (pure helpers)
+  evaluation/   evaluator.py (ONLY place that reads the hidden map), runner.py (metrics, Wilson CIs)
+  agents/       dqn_agent.py, ppo_agent.py, replay_buffer.py   (see only observations)
+  policies/     torch-free reference policies (random, onboard-greedy)
+  training/     agent-agnostic training loops
+  utils/        JSONL step logger, run metadata (git hash, versions, config)
+scripts/      audit_legacy.py, run_reference.py, train_dqn.py, train_ppo.py
+tests/        27 tests: accounting, seeding, leakage, legacy parity, loops, docs sync
+legacy/       original project, byte-for-byte (also at git tag v0.0-original)
 ```
 
-### Train PPO
-
+## Quick start
 ```
-python train_ppo.py
+python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt   # or: make setup
+make all-checks    # tests + legacy audit + torch-free reference run   (~30 s, no torch needed)
+make smoke         # first thing to run on your machine: exercises the torch agents (~1 min)
+make repro-check   # same seed twice => identical logs
+make baselines     # full DQN/PPO runs, 1500 episodes, both reward variants
 ```
+Recover the untouched original at any time: `git checkout v0.0-original`.
 
-### Compare Results
-
-Run comparison notebook or plotting script.
-
----
-
-# Visualization Outputs
-
-The repository generates:
-
-* Reward comparison graph
-* Battery usage comparison
-* Success rate comparison
-* Steps comparison
-* PPO vs DQN overlapping curves
-* Terrain visualization
-
----
-
-# Applications
-
-* Mars rover navigation
-* Lunar rover autonomy
-* Underwater robot navigation
-* Battery-aware robotics
-* Autonomous exploration vehicles
-
----
-
-# Future Work
-
-* Add continuous action space
-* Add SLAM integration
-* Multi-goal navigation
-* Real Mars terrain dataset
-* Multi-agent rover coordination
-
----
+## Rules for later tasks
+* Anything an agent, monitor or fallback planner uses must come from `obs`/`info` of `RoverEnv`. `tests/test_no_leakage.py` fails the build otherwise.
+* Never pick thresholds/hyper-parameters on test seeds (20 000+); use validation seeds (10 000+).
+* Success is `info["reason"] == "goal"`. Never infer it from reward.
