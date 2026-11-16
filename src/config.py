@@ -54,6 +54,10 @@ class PPOConfig:
     rollout_steps: int = 512
     grad_clip: float = 0.5
     hidden: tuple[int, ...] = (256, 256)
+    # Rewards are multiplied by this inside GAE only (env reward is untouched). Episode returns reach ~100-150
+    # (goal bonus), so the unscaled critic loss dominates the shared trunk and the clipped gradient norm.
+    # 1.0 = original behaviour; 0.02 puts returns near O(1-3).
+    reward_scale: float = 1.0
 
 
 @dataclass

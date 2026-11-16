@@ -56,6 +56,13 @@ class PPOAgent:
         return int(logits.argmax(-1).item()) if greedy else int(Categorical(logits=logits).sample().item())
 
     @torch.no_grad()
+    def policy_stats(self, obs) -> tuple[float, float]:
+        """(entropy in nats, max action probability) of the policy at `obs`; used by scripts/diagnose_ppo.py."""
+        logits, _ = self.model(torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0))
+        dist = Categorical(logits=logits)
+        return float(dist.entropy().item()), float(dist.probs.max().item())
+
+    @torch.no_grad()
     def value(self, obs) -> float:
         return float(self.model(torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0))[1].item())
 
@@ -68,7 +75,7 @@ class PPOAgent:
         gae, returns = 0.0, [0.0] * len(self.rewards)
         for t in reversed(range(len(self.rewards))):
             nonterminal = 1.0 - self.dones[t]
-            delta = self.rewards[t] + c.gamma * vals[t + 1] * nonterminal - vals[t]
+            delta = c.reward_scale * self.rewards[t] + c.gamma * vals[t + 1] * nonterminal - vals[t]
             gae = delta + c.gamma * c.lam * nonterminal * gae
             returns[t] = gae + vals[t]
         returns = np.asarray(returns, dtype=np.float32)

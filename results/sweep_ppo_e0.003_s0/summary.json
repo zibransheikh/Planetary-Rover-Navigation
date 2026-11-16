@@ -1,0 +1,85 @@
+{
+  "episodes": 1500,
+  "env_steps": 46221,
+  "wall_seconds": 7.2,
+  "train_time_SR_last100": 0.88,
+  "train_time_battery_last100": 57.41,
+  "train_time_min_battery": 0,
+  "greedy_val_200": {
+    "episodes": 200,
+    "success_rate": 0.845,
+    "success_ci95": [
+      0.7883919410627441,
+      0.8886043148536146
+    ],
+    "reasons": {
+      "goal": 169,
+      "battery_depleted": 31,
+      "timeout": 0
+    },
+    "mean_battery_left": 56.115,
+    "mean_battery_left_success": 66.40828402366864,
+    "mean_steps": 31.155,
+    "collisions_per_episode": 8.135,
+    "mean_energy_ratio_success": 1.4609024111982691,
+    "min_battery_seen": 0
+  },
+  "greedy_test_200": {
+    "episodes": 200,
+    "success_rate": 0.825,
+    "success_ci95": [
+      0.7663545078991807,
+      0.8713955882539106
+    ],
+    "reasons": {
+      "goal": 165,
+      "battery_depleted": 35,
+      "timeout": 0
+    },
+    "mean_battery_left": 53.32,
+    "mean_battery_left_success": 64.63030303030303,
+    "mean_steps": 33.275,
+    "collisions_per_episode": 7.93,
+    "mean_energy_ratio_success": 1.527937795270683,
+    "min_battery_seen": 0
+  },
+  "sampled_val_200": {
+    "episodes": 200,
+    "success_rate": 0.855,
+    "success_ci95": [
+      0.7995121871510563,
+      0.8971071486469359
+    ],
+    "reasons": {
+      "goal": 171,
+      "battery_depleted": 29,
+      "timeout": 0
+    },
+    "mean_battery_left": 55.84,
+    "mean_battery_left_success": 65.30994152046783,
+    "mean_steps": 28.625,
+    "collisions_per_episode": 3.695,
+    "mean_energy_ratio_success": 1.4924554855475904,
+    "min_battery_seen": 0
+  },
+  "sampled_test_200": {
+    "episodes": 200,
+    "success_rate": 0.875,
+    "success_ci95": [
+      0.8219846471534161,
+      0.9138808484078432
+    ],
+    "reasons": {
+      "goal": 175,
+      "battery_depleted": 25,
+      "timeout": 0
+    },
+    "mean_battery_left": 56.585,
+    "mean_battery_left_success": 64.66857142857143,
+    "mean_steps": 27.89,
+    "collisions_per_episode": 2.79,
+    "mean_energy_ratio_success": 1.5208682713178512,
+    "min_battery_seen": 0
+  },
+  "note": "train_time_* include exploration (DQN eps>=eps_min, PPO sampling); greedy_* are the deployable policy"
+}
