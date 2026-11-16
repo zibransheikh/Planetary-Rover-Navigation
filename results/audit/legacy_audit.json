@@ -27,9 +27,9 @@
   },
   "speed": {
     "legacy_dijkstra_calls_per_step": 1.92,
-    "legacy_us_per_step": 347.4,
-    "audited_onboard_us_per_step": 7.5,
-    "speedup_x": 46.6
+    "legacy_us_per_step": 184.4,
+    "audited_onboard_us_per_step": 3.6,
+    "speedup_x": 50.7
   },
   "seeding": {
     "two_unseeded_envs_same_map": false,

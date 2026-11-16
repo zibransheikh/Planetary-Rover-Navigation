@@ -1,0 +1,8 @@
+python3 scripts/train_dqn.py --config configs/baseline_10x10_onboard.yaml
+[DQN] train SR(last100)=0.84  greedy val SR=0.86  greedy test SR=0.88  wall=36.8s  -> results/ref_onboard_dqn_s0
+python3 scripts/train_ppo.py --config configs/baseline_10x10_onboard.yaml
+[PPO] train SR(last100)=0.85  greedy val SR=0.36  greedy test SR=0.34  wall=10.3s  -> results/ref_onboard_ppo_s0
+python3 scripts/train_dqn.py --config configs/baseline_10x10_onboard_shaped.yaml
+[DQN] train SR(last100)=0.87  greedy val SR=0.81  greedy test SR=0.80  wall=42.6s  -> results/ref_onboard_shaped_dqn_s0
+python3 scripts/train_ppo.py --config configs/baseline_10x10_onboard_shaped.yaml
+[PPO] train SR(last100)=0.79  greedy val SR=0.09  greedy test SR=0.09  wall=14.4s  -> results/ref_onboard_shaped_ppo_s0
