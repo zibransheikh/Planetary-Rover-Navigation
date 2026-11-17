@@ -24,6 +24,16 @@ class EnvConfig:
     max_steps: int | None = None  # default: battery (cannot trigger, every action costs >= 1)
     map_retry_limit: int = 1000
     ensure_energy_feasible: bool = True
+    # ---- Task 2 (kind == "advanced"): 32x32 partially observable simulator. Ignored by the basic env. ----
+    kind: str = "basic"                 # "basic" = Task-1 10x10 env | "advanced" = Task-2 POMDP env
+    gen_corr: int = 2                   # terrain clustering: # of 3x3 box-blur passes over the noise fields (0 = i.i.d.)
+    max_opt_cost_frac: float = 0.6      # map accepted only if reference optimal cost <= frac * battery (slack for slip/detours)
+    ref_energy_cost: tuple = (1, 3, 5)  # nominal energy table used ONLY for map acceptance (keeps maps identical across dynamics shifts)
+    energy_cost: tuple = (1, 3, 5)      # TRUE energy per entered cell: (normal, sand, rock)
+    slip_prob: tuple = (0.02, 0.10, 0.05)  # TRUE slip probability by terrain of the cell the rover stands on
+    sensor_miss: float = 0.05           # TRUE P(obstacle not detected)
+    sensor_false: float = 0.02          # TRUE P(free cell reported as obstacle)
+    sensor_sigma: float = 0.05          # TRUE std-dev of the terrain reading (reading scale 0..1)
 
 
 @dataclass

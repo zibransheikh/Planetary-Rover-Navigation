@@ -1,0 +1,38 @@
+diff --git a/scripts/train_dqn.py b/scripts/train_dqn.py
+index 2955274..77c9593 100644
+--- a/scripts/train_dqn.py
++++ b/scripts/train_dqn.py
+@@ -5,6 +5,7 @@ import torch
+ 
+ from src.agents.dqn_agent import DQNAgent
+ from src.config import load_config
++from src.evaluation.evaluator import make_env
+ from src.seeding import seed_everything
+ from src.training.loops import train_dqn
+ from src.utils.run_meta import write_meta
+@@ -15,8 +16,7 @@ out = args.out or f"{cfg.run.out_dir}_dqn_s{cfg.run.seed}"
+ torch.set_num_threads(cfg.run.torch_threads)
+ seed_everything(cfg.run.seed)
+ write_meta(out, cfg.to_dict())
+-from src.environment.rover_env import RoverEnv  # observation size comes from the env, never hard-coded
+-probe = RoverEnv(cfg.env, cfg.run.seed)
++probe, _ = make_env(cfg.env, cfg.run.seed)  # observation size comes from the env (basic 10x10 or advanced 32x32), never hard-coded
+ agent = DQNAgent(probe.obs_dim, probe.n_actions, cfg.dqn, seed=cfg.run.seed)
+ s = train_dqn(agent, cfg, out)
+ print(f"[DQN] train SR(last100)={s['train_time_SR_last100']:.2f}  greedy val SR={s['greedy_val_200']['success_rate']:.2f}  "
+diff --git a/src/policies/sim32_heuristic.py b/src/policies/sim32_heuristic.py
+index 0906f61..b59bb65 100644
+--- a/src/policies/sim32_heuristic.py
++++ b/src/policies/sim32_heuristic.py
+@@ -7,7 +7,10 @@ from __future__ import annotations
+ import numpy as np
+ 
+ from src.environment.advanced_env import FEATURES, R, W
+-from src.environment.terrain import DELTAS
++
++# action -> (d_row, d_col); same convention as the env (0 up, 1 down, 2 left, 3 right). Defined here on purpose:
++# policy modules must not import src.environment.terrain (it contains the full-map Dijkstra).
++DELTAS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+ 
+ _WIN0 = FEATURES.index(f"win_r{-R:+d}_c{-R:+d}")
+ _VIS0 = FEATURES.index(f"visits_r{-R:+d}_c{-R:+d}")
