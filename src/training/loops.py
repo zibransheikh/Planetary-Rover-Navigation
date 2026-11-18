@@ -96,7 +96,7 @@ def train_dqn(agent, cfg: Config, out_dir: str | Path) -> dict:
         obs2, r, done, info = env.step(a)
         agent.remember(obs, a, r, obs2, info["terminated"])
         obs = env.reset() if done else obs2
-    success, battery = [], []
+    success, battery, best_val = [], [], -1.0
     for ep in range(cfg.run.episodes):
         obs, total, margins, done = env.reset(), 0.0, [], False
         while not done:
@@ -113,8 +113,13 @@ def train_dqn(agent, cfg: Config, out_dir: str | Path) -> dict:
                        "battery": env.battery, "steps": info["steps"],
                        "mean_margin": float(np.mean(margins)) if margins else "", "epsilon": round(agent.epsilon, 4)})
         if (ep + 1) % cfg.run.eval_every == 0:
-            w.ev.writerow(_eval_row(ep + 1, _eval(agent, cfg, eval_env, eval_ev, cfg.run.val_seed_offset, cfg.run.eval_episodes)))
+            sv = _eval(agent, cfg, eval_env, eval_ev, cfg.run.val_seed_offset, cfg.run.eval_episodes)
+            w.ev.writerow(_eval_row(ep + 1, sv))
             w.ep_f.flush(); w.ev_f.flush()
+            if hasattr(agent, "save") and sv["success_rate"] >= best_val:  # selection uses VALIDATION maps only
+                best_val = sv["success_rate"]
+                (out / "checkpoints").mkdir(parents=True, exist_ok=True)
+                agent.save(out / "checkpoints" / "best_val.pt")
     return _finish(agent, cfg, out, w, success, battery, t0, n_steps, eval_env, eval_ev)
 
 
@@ -123,7 +128,7 @@ def train_ppo(agent, cfg: Config, out_dir: str | Path) -> dict:
     env, ev = make_env(cfg.env, seed=cfg.run.seed)
     eval_env, eval_ev = make_env(cfg.env, seed=cfg.run.seed)
     w, t0 = _Writers(out), time.time()
-    success, battery, n_steps, ep = [], [], 0, 0
+    success, battery, n_steps, ep, best_val = [], [], 0, 0, -1.0
     obs, total, margins = env.reset(), 0.0, []
     while ep < cfg.run.episodes:
         a, logp, v = agent.sample(obs)
@@ -141,8 +146,13 @@ def train_ppo(agent, cfg: Config, out_dir: str | Path) -> dict:
                            "mean_margin": float(np.mean(margins)) if margins else "", "epsilon": ""})
             ep += 1
             if ep % cfg.run.eval_every == 0:
-                w.ev.writerow(_eval_row(ep, _eval(agent, cfg, eval_env, eval_ev, cfg.run.val_seed_offset, cfg.run.eval_episodes)))
+                sv = _eval(agent, cfg, eval_env, eval_ev, cfg.run.val_seed_offset, cfg.run.eval_episodes)
+                w.ev.writerow(_eval_row(ep, sv))
                 w.ep_f.flush(); w.ev_f.flush()
+                if hasattr(agent, "save") and sv["success_rate"] >= best_val:  # selection uses VALIDATION maps only
+                    best_val = sv["success_rate"]
+                    (out / "checkpoints").mkdir(parents=True, exist_ok=True)
+                    agent.save(out / "checkpoints" / "best_val.pt")
             obs, total, margins = env.reset(), 0.0, []
         else:
             obs = obs2

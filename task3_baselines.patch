@@ -1,0 +1,1062 @@
+diff --git a/docs/TASK3_BASELINES.md b/docs/TASK3_BASELINES.md
+new file mode 100644
+index 0000000..adbee30
+--- /dev/null
++++ b/docs/TASK3_BASELINES.md
+@@ -0,0 +1,56 @@
++# Task 3 — navigation baselines and the shared evaluation protocol
++
++## Methods (all onboard-only; all go through `src/evaluation/harness.py`)
++
++| Key | What it is | Trained? |
++|---|---|---|
++| `astar` | Battery-aware A* on the **explored map** (`env.explored_map()`), replanning every step. Edge cost = expected energy of the entered cell from the *nominal* table; **unknown cells** cost `unknown_energy` + a risk premium that grows as the battery drains; believed obstacles are soft walls; collision-proven obstacles are hard walls; small penalty for revisits. | no |
++| `reactive` | Window-only heuristic (sanity reference, not a baseline in the paper). | no |
++| `dqn` | Double DQN (same algorithm/hyper-parameters as the audited original) on the 59-d observation, greedy at test time. | 10 seeds |
++| `dqn_shield` | The same DQN checkpoints wrapped by `RuleShield`: rejects invalid moves, moves into believed obstacles, and moves that make the goal unreachable on the remaining battery; overrides with the highest-Q safe action. No uncertainty / OOD signal (that is Task 4). | no (reuses `dqn`) |
++| `ppo`, `ppo_shield` | Added only after DQN and A* are stable (plan, Task 3). | — |
++
++## Protocol (what makes the comparison fair)
++
++* Training: in-distribution preset only (`configs/sim32_id.yaml`), 1 500 episodes, seeds 0-9. Training maps come from the
++  env's own seed stream. Two checkpoints are kept: `final.pt` and `best_val.pt` (best greedy success on the 50 validation maps
++  evaluated every 100 episodes; selection uses validation maps only).
++* Evaluation maps: validation = episode seeds 10 000+, test = 20 000+. Neither is ever trained on. Use `val` to look and choose;
++  run `test` once per configuration. Default checkpoint for evaluation: `best_val`.
++* One episode = (preset, seed). The map, start/goal, battery, slip draws and sensor noise are a function of that pair only, and
++  the slip/sensor streams use a fixed number of draws per step. So every method sees the same maps and the same random numbers
++  (common random numbers), which is what makes paired comparisons valid later.
++* Success = terminal reason `goal`. Shielded and unshielded runs are judged by the same code path.
++* Reporting: seeded methods = mean ± sd over seeds with a t-based 95% CI over seeds (CI clipped to [0,1]); unseeded methods =
++  Wilson 95% CI over maps. Seeds are the unit of replication for learned methods, so do not pool episodes across seeds for a CI.
++
++## Metrics (per episode, `results/task3/eval/<split>/<preset>/<method>[_sK].csv`)
++
++`success, reason, steps, reward, battery_left, energy_used, collisions` (resulting events, incl. slip-caused),
++`attempted_unsafe` (the COMMANDED move targets an obstacle / leaves the map, judged from ground truth by the evaluator),
++`interventions / decisions / no_safe_action` (shield), `optimal_cost`, `energy_ratio` (energy / optimal cost, successes only),
++`plan_ms` (decision latency). Attempted-unsafe and collisions are deliberately separate (plan, §5): a slip next to an obstacle is
++a collision without an unsafe command.
++
++## Run it
++
++```bash
++python3 scripts/run_task3.py train  --jobs 4                 # DQN seeds 0-9 (each ~25-30 min single-threaded; --jobs parallelises)
++python3 scripts/run_task3.py eval   --split val  --jobs 4    # look here first
++python3 scripts/run_task3.py report --split val
++python3 scripts/run_task3.py curves                           # training stability across seeds
++python3 scripts/run_task3.py eval   --split test --jobs 4    # once the setup is settled
++python3 scripts/run_task3.py report --split test
++# shifts are Task 7, but the harness already supports them:  --presets id,terrain_shift,sensor_shift,dynamics_shift,combined_shift
++```
++`results/task3/manifest.json` records seeds, config, git commit and software versions of the training run.
++
++## Stability gate before adding PPO
++
++`run_task3.py curves` prints greedy validation success at every checkpoint episode across seeds and applies the gate:
++**last-checkpoint mean >= 0.80 and no seed below 0.60**, and A* >= 0.90 on validation maps. Only then is PPO added
++(`ppo`, `ppo_shield`) with the reward-scale / entropy settings from the Task-1 PPO fix.
++
++Known behaviour from a 2-seed, 700-episode probe (not the final protocol): greedy validation success dips sharply around
++episodes 300-500 (0.0-0.1 at episode 400) as epsilon reaches its floor, then recovers (0.88-0.92 at episode 700). This is why
++`best_val.pt` is kept and why 1 500 episodes are used; the 10-seed curves will show whether it persists.
+diff --git a/scripts/run_task3.py b/scripts/run_task3.py
+new file mode 100644
+index 0000000..35cec6b
+--- /dev/null
++++ b/scripts/run_task3.py
+@@ -0,0 +1,216 @@
++"""Task 3 pipeline: train DQN on 10 seeds, evaluate every baseline through ONE harness, report mean +/- CI over seeds.
++
++  python scripts/run_task3.py train  --jobs 4                      # DQN seeds 0-9 (skips finished runs; --force to redo)
++  python scripts/run_task3.py eval   --split val  --jobs 4         # choose nothing on test; look at val first
++  python scripts/run_task3.py eval   --split test --jobs 4 --presets id
++  python scripts/run_task3.py report --split test
++  python scripts/run_task3.py curves                               # training stability across seeds (gate for adding PPO)
++Training uses the in-distribution config only. Checkpoints: best_val.pt (best greedy SR on validation maps during
++training; validation maps only) and final.pt. Evaluation maps: val = seeds 10000+, test = 20000+ (never trained on).
++"""
++from _common import ROOT  # noqa: F401
++
++import argparse
++import csv
++import json
++import math
++import platform
++import re
++import subprocess
++import sys
++import time
++from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
++from pathlib import Path
++
++import numpy as np
++
++T975 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228, 11: 2.201,
++        12: 2.179, 13: 2.160, 14: 2.145, 15: 2.131, 16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093, 20: 2.086, 21: 2.080,
++        22: 2.074, 23: 2.069, 24: 2.064, 25: 2.060, 26: 2.056, 27: 2.052, 28: 2.048, 29: 2.045, 30: 2.042}
++SEEDED = ("dqn", "dqn_shield")          # trained per seed
++SEEDLESS = ("astar", "reactive")        # no training: one deterministic evaluation
++ALL_METHODS = ("astar", "reactive", "dqn", "dqn_shield")
++
++
++def parse_seeds(s: str) -> list[int]:
++    out = []
++    for part in s.split(","):
++        a, _, b = part.partition("-")
++        out += list(range(int(a), int(b) + 1)) if b else [int(a)]
++    return out
++
++
++def run_dir(out: Path, seed: int) -> Path:
++    return out / "train" / f"dqn_s{seed}"
++
++
++# ------------------------------------------------------------------ train
++def _train_one(args):
++    cfg, seed, out, force = args
++    d = run_dir(out, seed)
++    if (d / "summary.json").exists() and not force:
++        return seed, "skipped (done)", 0.0
++    t0 = time.time()
++    env = {**__import__("os").environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
++    r = subprocess.run([sys.executable, str(ROOT / "scripts/train_dqn.py"), "--config", cfg, "--seed", str(seed), "--out", str(d)],
++                       capture_output=True, text=True, env=env)
++    return seed, (r.stdout.strip().splitlines() or [""])[-1] if r.returncode == 0 else f"FAILED: {r.stderr[-400:]}", time.time() - t0
++
++
++def cmd_train(a):
++    out = ROOT / a.out
++    out.mkdir(parents=True, exist_ok=True)
++    seeds = parse_seeds(a.seeds)
++    try:
++        import torch
++        commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=ROOT).stdout.strip()
++        manifest = {"seeds": seeds, "config": a.config, "git_commit": commit, "python": platform.python_version(),
++                    "torch": torch.__version__, "numpy": np.__version__, "platform": platform.platform(),
++                    "started": time.strftime("%Y-%m-%d %H:%M:%S")}
++        (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
++    except Exception as e:  # manifest is best-effort
++        print("manifest skipped:", e)
++    print(f"training DQN seeds {seeds} with {a.jobs} parallel job(s)")
++    with ThreadPoolExecutor(a.jobs) as ex:
++        for seed, msg, dt in ex.map(_train_one, [(a.config, s, out, a.force) for s in seeds]):
++            print(f"  seed {seed}: {msg}  ({dt / 60:.1f} min)")
++
++
++# ------------------------------------------------------------------ eval
++def _eval_one(task):
++    kind, seed, ckpt_name, preset, split, n_maps, out, cfg_train = task
++    import torch
++    torch.set_num_threads(1)
++    from src.config import load_config
++    from src.evaluation.harness import SPLIT_OFFSET, build_policy, evaluate_method
++    out = Path(out)
++    cfg = load_config(ROOT / cfg_train)
++    tag = kind if kind in SEEDLESS else f"{kind}_s{seed}"
++    dest = out / "eval" / split / preset
++    ckpt = None if kind in SEEDLESS else str(run_dir(out, seed) / "checkpoints" / f"{ckpt_name}.pt")
++    if ckpt and not Path(ckpt).exists():
++        return tag, preset, "missing checkpoint " + ckpt
++    pol = build_policy(kind, cfg, ckpt, seed=seed)
++    off = SPLIT_OFFSET[split]
++    _, summ = evaluate_method(pol, ROOT / f"configs/sim32_{preset}.yaml", range(off, off + n_maps), tag, preset, dest / f"{tag}.csv")
++    (dest / f"{tag}.json").write_text(json.dumps(summ, indent=2, default=float))
++    return tag, preset, f"SR {summ['success_rate']:.2f}"
++
++
++def cmd_eval(a):
++    out = ROOT / a.out
++    seeds, presets = parse_seeds(a.seeds), a.presets.split(",")
++    tasks = []
++    for p in presets:
++        for kind in a.methods.split(","):
++            for s in ([0] if kind in SEEDLESS else seeds):
++                tasks.append((kind, s, a.ckpt, p, a.split, a.n_maps, str(out), a.config))
++    print(f"{len(tasks)} evaluation tasks ({a.split} maps x {a.n_maps}, presets {presets}, ckpt={a.ckpt})")
++    with ProcessPoolExecutor(a.jobs) as ex:
++        for tag, preset, msg in ex.map(_eval_one, tasks):
++            print(f"  {preset:15} {tag:14} {msg}")
++
++
++# ------------------------------------------------------------------ report
++def wilson(k, n, z=1.96):
++    if n == 0:
++        return float("nan"), float("nan")
++    p, d = k / n, 1 + z * z / n
++    c, h = (p + z * z / (2 * n)) / d, z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
++    return c - h, c + h
++
++
++def _load(path):
++    with open(path) as f:
++        return list(csv.DictReader(f))
++
++
++def _mean_of(rows, key, only_success=False):
++    v = [float(r[key]) for r in rows if (not only_success or r["success"] == "1") and r[key] not in ("", "nan")]
++    return float(np.mean(v)) if v else float("nan")
++
++
++def cmd_report(a):
++    out = ROOT / a.out
++    lines, csv_rows = [], []
++    for preset_dir in sorted((out / "eval" / a.split).glob("*")):
++        preset = preset_dir.name
++        lines += [f"\n### {preset} — {a.split} maps\n", "| Method | Success rate | 95% CI | n | Collisions/ep | Unsafe attempts/ep | Energy / optimal | Battery left (success) | Steps | Intervention rate |",
++                  "|---|---|---|---|---|---|---|---|---|---|"]
++        for kind in ALL_METHODS:
++            pat = re.compile(rf"{kind}\.csv" if kind in SEEDLESS else rf"{kind}_s\d+\.csv")  # exact: dqn_s* must not match dqn_shield_s*
++            files = sorted(f for f in preset_dir.glob("*.csv") if pat.fullmatch(f.name))
++            if not files:
++                continue
++            per_seed = [_load(f) for f in files]
++            allr = [r for rows in per_seed for r in rows]
++            srs = np.array([np.mean([int(r["success"]) for r in rows]) for rows in per_seed])
++            if kind in SEEDLESS:
++                k, n = int(sum(int(r["success"]) for r in allr)), len(allr)
++                lo, hi = wilson(k, n)
++                sr_txt, ci_txt, n_txt = f"{k / n:.3f}", f"[{lo:.3f}, {hi:.3f}] (Wilson over maps)", f"{n} maps"
++            else:
++                m, sd = srs.mean(), srs.std(ddof=1) if len(srs) > 1 else float("nan")
++                h = T975.get(len(srs) - 1, 1.96) * sd / math.sqrt(len(srs)) if len(srs) > 1 else float("nan")
++                lo_, hi_ = max(0.0, m - h), min(1.0, m + h)  # clipped to [0,1]
++                sr_txt, ci_txt, n_txt = f"{m:.3f} ± {sd:.3f}", f"[{lo_:.3f}, {hi_:.3f}] (t over {len(srs)} seeds)", f"{len(srs)}x{len(per_seed[0])}"
++            dec = sum(int(r["decisions"]) for r in allr)
++            interv = f"{sum(int(r['interventions']) for r in allr) / dec:.3f}" if kind == "dqn_shield" and dec else "—"
++            row = [kind, sr_txt, ci_txt, n_txt, f"{_mean_of(allr, 'collisions'):.2f}", f"{_mean_of(allr, 'attempted_unsafe'):.2f}",
++                   f"{_mean_of(allr, 'energy_ratio', True):.2f}", f"{_mean_of(allr, 'battery_left', True):.0f}", f"{_mean_of(allr, 'steps'):.0f}", interv]
++            lines.append("| " + " | ".join(row) + " |")
++            csv_rows.append([preset, a.split] + row)
++            if kind in SEEDED:
++                lines.append(f"|   per-seed SR | {', '.join(f'{x:.2f}' for x in srs)} | | | | | | | | |")
++    text = "\n".join(lines)
++    print(text)
++    (out / f"report_{a.split}.md").write_text(text + "\n")
++    with open(out / f"summary_{a.split}.csv", "w", newline="") as f:
++        w = csv.writer(f)
++        w.writerow(["preset", "split", "method", "success_rate", "ci95", "n", "collisions_per_ep", "unsafe_per_ep",
++                    "energy_ratio", "battery_left_success", "steps", "intervention_rate"])
++        w.writerows(csv_rows)
++
++
++def cmd_curves(a):
++    """Greedy validation success during training, per checkpoint episode, across seeds (stability check)."""
++    out = ROOT / a.out
++    runs = {s: _load(run_dir(out, s) / "eval_greedy_val.csv") for s in parse_seeds(a.seeds) if (run_dir(out, s) / "eval_greedy_val.csv").exists()}
++    if not runs:
++        print("no training runs found")
++        return
++    eps = sorted({int(r["episode"]) for rows in runs.values() for r in rows})
++    lines = [f"Greedy validation success during training ({len(runs)} seeds; each point = {a.n_maps_curve} maps)\n",
++             "| episode | mean | sd | min | max | seeds below 0.5 |", "|---|---|---|---|---|---|"]
++    csv_rows = []
++    for e in eps:
++        v = np.array([float(r["success_rate"]) for rows in runs.values() for r in rows if int(r["episode"]) == e])
++        sd = v.std(ddof=1) if len(v) > 1 else float("nan")
++        lines.append(f"| {e} | {v.mean():.2f} | {sd:.2f} | {v.min():.2f} | {v.max():.2f} | {int((v < 0.5).sum())}/{len(v)} |")
++        csv_rows.append([e, v.mean(), sd, v.min(), v.max(), int((v < 0.5).sum()), len(v)])
++    final = np.array([float(rows[-1]["success_rate"]) for rows in runs.values()])
++    lines.append(f"\nLast checkpoint: mean {final.mean():.2f}, min {final.min():.2f} over {len(final)} seeds. "
++                 f"STABILITY GATE for adding PPO: mean >= 0.80 and min >= 0.60 -> {'PASS' if final.mean() >= 0.8 and final.min() >= 0.6 else 'NOT YET'}")
++    print("\n".join(lines))
++    (out / "learning_curve_val.md").write_text("\n".join(lines) + "\n")
++    with open(out / "learning_curve_val.csv", "w", newline="") as f:
++        w = csv.writer(f)
++        w.writerow(["episode", "mean", "sd", "min", "max", "n_below_0.5", "n_seeds"])
++        w.writerows(csv_rows)
++
++
++ap = argparse.ArgumentParser()
++ap.add_argument("cmd", choices=["train", "eval", "report", "curves"])
++ap.add_argument("--config", default="configs/sim32_id.yaml", help="TRAINING config (in-distribution)")
++ap.add_argument("--seeds", default="0-9")
++ap.add_argument("--jobs", type=int, default=2)
++ap.add_argument("--out", default="results/task3")
++ap.add_argument("--split", choices=["val", "test"], default="val")
++ap.add_argument("--presets", default="id")
++ap.add_argument("--methods", default=",".join(ALL_METHODS))
++ap.add_argument("--n-maps", type=int, default=200)
++ap.add_argument("--ckpt", choices=["best_val", "final"], default="best_val", help="best_val = best greedy SR on VALIDATION maps during training")
++ap.add_argument("--force", action="store_true")
++ap.add_argument("--n-maps-curve", type=int, default=50, help="validation maps per curve point (= run.eval_episodes)")
++args = ap.parse_args()
++{"train": cmd_train, "eval": cmd_eval, "report": cmd_report, "curves": cmd_curves}[args.cmd](args)
+diff --git a/src/evaluation/evaluator.py b/src/evaluation/evaluator.py
+index 5904ce9..ea24082 100644
+--- a/src/evaluation/evaluator.py
++++ b/src/evaluation/evaluator.py
+@@ -80,6 +80,14 @@ class AdvancedEvaluator(Evaluator):
+         e._install_world(grid, start, goal, int(min(dist, T.INF)), map_id)
+         return e._observe()
+ 
++    def commanded_cell_unsafe(self, action: int) -> bool:
++        """True if the COMMANDED move (before any slip) targets an obstacle or leaves the map. Scoring only."""
++        e = self._env
++        x, y = e.position
++        dx, dy = T.DELTAS[int(action)]
++        nx, ny = x + dx, y + dy
++        return not (0 <= nx < e.size and 0 <= ny < e.size) or bool(e._world.grid[nx, ny] == T.OBSTACLE)
++
+     @property
+     def true_slip(self):
+         return self._env._slip
+diff --git a/src/evaluation/harness.py b/src/evaluation/harness.py
+new file mode 100644
+index 0000000..a6c56f9
+--- /dev/null
++++ b/src/evaluation/harness.py
+@@ -0,0 +1,118 @@
++"""ONE evaluation interface for every Task-3+ method (A*, reactive, DQN, shielded DQN, later PPO / the assurance system).
++
++Fairness by construction:
++  * a method is just an object with `act(obs) -> int` (+ optional `attach`, `stats`, `last_decision`);
++  * every method sees the SAME maps, start/goal, battery and noise: an episode is fully determined by (preset, seed),
++    and the slip and sensor streams consume a fixed number of draws per step, so methods that take the same number of
++    steps see the same random numbers (common random numbers -> paired comparisons are valid);
++  * success == terminal reason "goal"; all rows come from the same code path.
++Metrics added to the Task-1 runner row: attempted_unsafe (commanded move into an obstacle/off-map, judged by the
++evaluator from ground truth), interventions/decisions (shield), plan_ms (decision latency).
++"""
++from __future__ import annotations
++
++import csv
++import time
++from pathlib import Path
++
++import numpy as np
++
++from src.config import Config, load_config
++from src.evaluation.evaluator import make_env
++from src.evaluation.runner import summarise
++
++ROW_FIELDS = ["method", "preset", "map", "success", "reason", "steps", "reward", "battery_left", "energy_used", "collisions",
++              "attempted_unsafe", "interventions", "decisions", "no_safe_action", "optimal_cost", "energy_ratio", "plan_ms"]
++SPLIT_OFFSET = {"val": 10_000, "test": 20_000}
++
++
++class GreedyAgentPolicy:
++    """Greedy (argmax) evaluation wrapper for DQN/PPO agents; exposes q_values when the agent has them."""
++
++    def __init__(self, agent, name: str):
++        self.agent, self.name = agent, name
++
++    def act(self, obs) -> int:
++        return self.agent.act(obs, greedy=True)
++
++    def q_values(self, obs):
++        return self.agent.q_values(obs)
++
++
++def _attach(policy, env) -> None:
++    for p in (policy, getattr(policy, "base", None)):
++        if p is not None and hasattr(p, "attach"):
++            p.attach(env.explored_map, env.max_battery)  # the env's PUBLIC onboard API only
++
++
++def _stat_snapshot(policy) -> tuple[int, int, int]:
++    s = getattr(policy, "stats", None)
++    return (s["decisions"], s["interventions"], s["no_safe_action"]) if s else (0, 0, 0)
++
++
++def run_episode_ext(env, ev, policy, seed: int, method: str = "", preset: str = "") -> dict:
++    obs = env.reset(seed=seed)
++    d0 = _stat_snapshot(policy)
++    energy = collisions = unsafe = 0
++    total_r, done, info, t_dec = 0.0, False, {}, 0.0
++    while not done:
++        t0 = time.perf_counter()
++        a = int(policy.act(obs))
++        t_dec += time.perf_counter() - t0
++        unsafe += ev.commanded_cell_unsafe(a)
++        obs, r, done, info = env.step(a)
++        total_r += r
++        energy += info["energy_used"]
++        collisions += info["event"].endswith("collision")
++    d1 = _stat_snapshot(policy)
++    ok = info["reason"] == "goal"
++    return {"method": method, "preset": preset, "map": env.map_id, "success": int(ok), "reason": info["reason"],
++            "steps": info["steps"], "reward": round(total_r, 3), "battery_left": env.battery, "energy_used": energy,
++            "collisions": int(collisions), "attempted_unsafe": int(unsafe), "interventions": d1[1] - d0[1],
++            "decisions": d1[0] - d0[0], "no_safe_action": d1[2] - d0[2], "optimal_cost": ev.optimal_cost,
++            "energy_ratio": (energy / ev.optimal_cost) if ok else float("nan"),
++            "plan_ms": 1000.0 * t_dec / max(info["steps"], 1)}
++
++
++def evaluate_method(policy, cfg_path, seeds, method: str, preset: str, out_csv=None):
++    """Fresh env per call (same cfg, same seed list -> same episodes for every method). Returns (rows, summary)."""
++    cfg = load_config(cfg_path)
++    env, ev = make_env(cfg.env, 0)
++    _attach(policy, env)
++    rows = [run_episode_ext(env, ev, policy, s, method, preset) for s in seeds]
++    summ = summarise(rows)
++    n = len(rows)
++    summ.update({"attempted_unsafe_per_episode": sum(r["attempted_unsafe"] for r in rows) / n,
++                 "mean_energy_used": float(np.mean([r["energy_used"] for r in rows])),
++                 "mean_plan_ms": float(np.mean([r["plan_ms"] for r in rows])),
++                 "intervention_rate": (sum(r["interventions"] for r in rows) / max(sum(r["decisions"] for r in rows), 1))
++                 if any(r["decisions"] for r in rows) else None})
++    if out_csv:
++        Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
++        with open(out_csv, "w", newline="") as f:
++            w = csv.DictWriter(f, ROW_FIELDS)
++            w.writeheader()
++            w.writerows(rows)
++    return rows, summ
++
++
++def build_policy(kind: str, cfg: Config, ckpt: str | None = None, seed: int = 0):
++    """kind: random | reactive | astar | dqn | dqn_shield   (ppo / ppo_shield are added after DQN and A* are stable)."""
++    from src.policies.astar_battery import BatteryAwareAStar
++    from src.policies.baseline_policies import RandomPolicy
++    from src.policies.rule_shield import RuleShield
++    from src.policies.sim32_heuristic import ReactiveExplorer
++    if kind == "random":
++        return RandomPolicy(seed)
++    if kind == "reactive":
++        return ReactiveExplorer(seed)
++    if kind == "astar":
++        return BatteryAwareAStar(nominal_energy=cfg.env.ref_energy_cost, seed=seed)
++    if kind in ("dqn", "dqn_shield"):
++        from src.agents.dqn_agent import DQNAgent
++        probe, _ = make_env(cfg.env, 0)
++        agent = DQNAgent(probe.obs_dim, probe.n_actions, cfg.dqn, seed=seed)
++        agent.load(ckpt)
++        base = GreedyAgentPolicy(agent, "dqn")
++        return base if kind == "dqn" else RuleShield(base, nominal_energy=cfg.env.ref_energy_cost)
++    raise ValueError(f"unknown method {kind!r}")
+diff --git a/src/policies/astar_battery.py b/src/policies/astar_battery.py
+new file mode 100644
+index 0000000..5a00008
+--- /dev/null
++++ b/src/policies/astar_battery.py
+@@ -0,0 +1,104 @@
++"""Battery-aware A* over the EXPLORED map (Task 3 baseline). Onboard information only.
++
++Plans on `explored_map()` (what the rover has sensed/touched) plus its own position, goal offset and battery.
++It never sees the true grid. Every cell gets an explicit expected cost:
++
++  known free cell      nominal energy of its estimated terrain class (normal/sand/rock = documented nominal table)
++  UNKNOWN cell         `unknown_energy` + a risk premium that GROWS as the battery drains (less reserve = less gambling)
++  believed obstacle    soft wall (`obstacle_penalty`): a false detection cannot deadlock the planner; a collision later
++                       proves it (`bumped`) and the cell becomes a hard wall
++  revisited cell       small `visit_penalty` per prior visit (breaks ping-pong loops caused by slips / sensor noise)
++
++It replans every step. `last_plan` records the estimate so the Task-4 monitor/logs can use it.
++Nominal energies are the rover's DOCUMENTED estimates: under a dynamics shift the true costs differ and A* is not told.
++"""
++from __future__ import annotations
++
++import heapq
++
++import numpy as np
++
++_DELTAS = ((-1, 0), (1, 0), (0, -1), (0, 1))  # same action convention as the env (defined locally on purpose)
++
++
++class BatteryAwareAStar:
++    name = "battery_astar"
++
++    def __init__(self, nominal_energy=(1.0, 3.0, 5.0), unknown_energy: float = 2.0, unknown_risk: float = 1.0,
++                 risk_battery_gain: float = 2.0, obstacle_penalty: float = 40.0, visit_penalty: float = 0.3,
++                 feasibility_margin: float = 1.0, seed: int = 0):
++        if min(nominal_energy) < 1 or unknown_energy < 1:
++            raise ValueError("all expected cell costs must be >= 1 (keeps the Manhattan heuristic admissible)")
++        self.nominal = tuple(float(v) for v in nominal_energy)
++        self.unknown_energy, self.unknown_risk, self.risk_gain = unknown_energy, unknown_risk, risk_battery_gain
++        self.obstacle_penalty, self.visit_penalty, self.margin = obstacle_penalty, visit_penalty, feasibility_margin
++        self.rng = np.random.default_rng(seed)
++        self._get_map, self._capacity = None, None
++        self.last_plan: dict = {}
++
++    def attach(self, get_map, battery_capacity: float) -> None:
++        """`get_map` = the env's public `explored_map` (onboard). `battery_capacity` = the rover's nominal capacity."""
++        self._get_map, self._capacity = get_map, float(battery_capacity)
++
++    # ------------------------------------------------------------------ cost model
++    def _grids(self, m, battery_ratio: float):
++        known = m.seen > 0
++        tm = m.terrain_mean
++        e = np.where(np.nan_to_num(tm, nan=0.0) < 0.15, self.nominal[0],
++                     np.where(np.nan_to_num(tm, nan=0.0) < 0.45, self.nominal[1], self.nominal[2]))
++        of = np.nan_to_num(m.obstacle_frac, nan=0.0)
++        soft = known & (of > 0.5)
++        premium = self.unknown_risk * (1.0 + self.risk_gain * (1.0 - battery_ratio))
++        energy = np.where(known, e, self.unknown_energy)           # pure energy estimate (for the feasibility check)
++        cost = np.where(known, e, self.unknown_energy + premium)   # planning cost
++        cost = np.where(soft, self.obstacle_penalty, cost) + self.visit_penalty * np.minimum(m.visits, 3)
++        cost = np.where(m.bumped, np.inf, cost)
++        return cost, np.where(soft, 1.0, energy), ~known
++
++    def _astar(self, cost, start, goal):
++        n = cost.shape[0]
++        g = np.full((n, n), np.inf)
++        g[start] = 0.0
++        parent = {}
++        h = lambda p: abs(p[0] - goal[0]) + abs(p[1] - goal[1])  # noqa: E731  (every cell costs >= 1)
++        heap = [(h(start), 0.0, start)]
++        while heap:
++            _, gc, cur = heapq.heappop(heap)
++            if cur == goal:
++                path = [cur]
++                while cur != start:
++                    cur = parent[cur]
++                    path.append(cur)
++                return path[::-1], gc
++            if gc > g[cur]:
++                continue
++            for dr, dc in _DELTAS:
++                nxt = (cur[0] + dr, cur[1] + dc)
++                if 0 <= nxt[0] < n and 0 <= nxt[1] < n and np.isfinite(cost[nxt]):
++                    ng = gc + cost[nxt]
++                    if ng < g[nxt]:
++                        g[nxt] = ng
++                        parent[nxt] = cur
++                        heapq.heappush(heap, (ng + h(nxt), ng, nxt))
++        return None, np.inf
++
++    # ------------------------------------------------------------------ policy
++    def act(self, obs) -> int:
++        if self._get_map is None:
++            raise RuntimeError("call attach(env.explored_map, env.max_battery) before act()")
++        m = self._get_map()
++        n = m.seen.shape[0]
++        pos = (int(round(obs[0] * (n - 1))), int(round(obs[1] * (n - 1))))
++        goal = (pos[0] + int(round(obs[2] * (n - 1))), pos[1] + int(round(obs[3] * (n - 1))))
++        cost, energy, unknown = self._grids(m, float(obs[4]))
++        path, total = self._astar(cost, pos, goal)
++        battery = float(obs[4]) * self._capacity
++        if path is None or len(path) < 2:
++            self.last_plan = {"path": None, "cost": np.inf, "energy_est": np.inf, "feasible": False, "n_unknown": 0}
++            return int(self.rng.integers(4))
++        cells = path[1:]
++        e_est = float(sum(energy[c] for c in cells))
++        self.last_plan = {"path": path, "cost": float(total), "energy_est": e_est,
++                          "feasible": e_est * self.margin <= battery, "n_unknown": int(sum(unknown[c] for c in cells))}
++        step = (path[1][0] - pos[0], path[1][1] - pos[1])
++        return _DELTAS.index(step)
+diff --git a/src/policies/rule_shield.py b/src/policies/rule_shield.py
+new file mode 100644
+index 0000000..6a602b8
+--- /dev/null
++++ b/src/policies/rule_shield.py
+@@ -0,0 +1,87 @@
++"""Conventional rule-based safety shield (Task 3 baseline). Onboard information only.
++
++Wraps any base policy. For the proposed action it checks three explicit, testable rules; if one fails it overrides with
++the best remaining action (highest base Q-value if the base exposes `q_values`, otherwise closest to the goal):
++
++  invalid_action   the action would leave the map
++  obstacle         the target cell is believed blocked: detected in the current 5x5 window, believed so in the explored
++                   map (majority of readings), or proven by an earlier collision
++  battery          even the best case cannot work out: entry energy of the target (nominal table, from its reading)
++                   exceeds the battery, or battery after the move < Manhattan distance to goal (>= 1 energy per step)
++
++Deliberately NO uncertainty or OOD signal: that is what the Task-4 runtime-assurance system adds. Per-decision
++counters (`stats`) give the intervention rate and the rules that fired. If every action violates a rule, the base action
++is kept and counted in `no_safe_action`.
++"""
++from __future__ import annotations
++
++from collections import Counter
++
++import numpy as np
++
++_DELTAS = ((-1, 0), (1, 0), (0, -1), (0, 1))
++_WIN0, _W, _R = 9, 5, 2   # window block of the 59-d observation (see docs/OBSERVATION_SCHEMA_V2.md)
++RULES = ("invalid_action", "obstacle", "battery")
++
++
++class RuleShield:
++    name = "rule_shield"
++
++    def __init__(self, base, nominal_energy=(1.0, 3.0, 5.0)):
++        self.base, self.nominal = base, tuple(float(v) for v in nominal_energy)
++        self._get_map, self._capacity = None, None
++        self.stats = {"decisions": 0, "interventions": 0, "no_safe_action": 0, "by_rule": Counter()}
++        self.last_decision: dict = {}
++
++    def attach(self, get_map, battery_capacity: float) -> None:
++        self._get_map, self._capacity = get_map, float(battery_capacity)
++
++    def _entry_energy(self, reading: float) -> float:
++        return self.nominal[0] if reading < 0.15 else self.nominal[1] if reading < 0.45 else self.nominal[2]
++
++    def violations(self, obs, action: int, m) -> list[str]:
++        n = m.seen.shape[0]
++        x, y = int(round(obs[0] * (n - 1))), int(round(obs[1] * (n - 1)))
++        gx, gy = x + int(round(obs[2] * (n - 1))), y + int(round(obs[3] * (n - 1)))
++        dr, dc = _DELTAS[action]
++        tx, ty = x + dr, y + dc
++        if not (0 <= tx < n and 0 <= ty < n):
++            return ["invalid_action"]
++        out = []
++        reading = float(obs[_WIN0 + (_R + dr) * _W + (_R + dc)])
++        belief = m.obstacle_frac[tx, ty]
++        if reading >= 0.999 or m.bumped[tx, ty] or (not np.isnan(belief) and belief > 0.5):
++            out.append("obstacle")
++        battery = float(obs[4]) * self._capacity
++        entry = self._entry_energy(reading) if reading < 0.999 else 1.0
++        if entry > battery or battery - entry < abs(tx - gx) + abs(ty - gy):
++            out.append("battery")
++        return out
++
++    def act(self, obs) -> int:
++        if self._get_map is None:
++            raise RuntimeError("call attach(env.explored_map, env.max_battery) before act()")
++        m = self._get_map()
++        proposed = int(self.base.act(obs))
++        self.stats["decisions"] += 1
++        bad = self.violations(obs, proposed, m)
++        self.last_decision = {"proposed": proposed, "executed": proposed, "violations": bad, "intervened": False}
++        if not bad:
++            return proposed
++        self.stats["interventions"] += 1
++        self.stats["by_rule"][bad[0]] += 1
++        ok = [a for a in range(4) if not self.violations(obs, a, m)]
++        self.last_decision["intervened"] = True
++        if not ok:
++            self.stats["no_safe_action"] += 1
++            self.last_decision["no_safe_action"] = True
++            return proposed
++        if hasattr(self.base, "q_values"):
++            q = np.asarray(self.base.q_values(obs))
++            choice = max(ok, key=lambda a: q[a])
++        else:
++            n = m.seen.shape[0]
++            gdx, gdy = obs[2] * (n - 1), obs[3] * (n - 1)
++            choice = max(ok, key=lambda a: _DELTAS[a][0] * gdx + _DELTAS[a][1] * gdy)
++        self.last_decision["executed"] = int(choice)
++        return int(choice)
+diff --git a/src/training/loops.py b/src/training/loops.py
+index ecdb144..28128ef 100644
+--- a/src/training/loops.py
++++ b/src/training/loops.py
+@@ -96,7 +96,7 @@ def train_dqn(agent, cfg: Config, out_dir: str | Path) -> dict:
+         obs2, r, done, info = env.step(a)
+         agent.remember(obs, a, r, obs2, info["terminated"])
+         obs = env.reset() if done else obs2
+-    success, battery = [], []
++    success, battery, best_val = [], [], -1.0
+     for ep in range(cfg.run.episodes):
+         obs, total, margins, done = env.reset(), 0.0, [], False
+         while not done:
+@@ -113,8 +113,13 @@ def train_dqn(agent, cfg: Config, out_dir: str | Path) -> dict:
+                        "battery": env.battery, "steps": info["steps"],
+                        "mean_margin": float(np.mean(margins)) if margins else "", "epsilon": round(agent.epsilon, 4)})
+         if (ep + 1) % cfg.run.eval_every == 0:
+-            w.ev.writerow(_eval_row(ep + 1, _eval(agent, cfg, eval_env, eval_ev, cfg.run.val_seed_offset, cfg.run.eval_episodes)))
++            sv = _eval(agent, cfg, eval_env, eval_ev, cfg.run.val_seed_offset, cfg.run.eval_episodes)
++            w.ev.writerow(_eval_row(ep + 1, sv))
+             w.ep_f.flush(); w.ev_f.flush()
++            if hasattr(agent, "save") and sv["success_rate"] >= best_val:  # selection uses VALIDATION maps only
++                best_val = sv["success_rate"]
++                (out / "checkpoints").mkdir(parents=True, exist_ok=True)
++                agent.save(out / "checkpoints" / "best_val.pt")
+     return _finish(agent, cfg, out, w, success, battery, t0, n_steps, eval_env, eval_ev)
+ 
+ 
+diff --git a/tests/test_task3.py b/tests/test_task3.py
+new file mode 100644
+index 0000000..178d75b
+--- /dev/null
++++ b/tests/test_task3.py
+@@ -0,0 +1,398 @@
++"""Task 3: battery-aware A*, rule-based shield, shared harness, and the DQN checks (replay contents, target updates,
++exploration schedule, reward, checkpoints)."""
++import ast
++import csv
++import importlib.util
++import tempfile
++import unittest
++from dataclasses import replace
++from pathlib import Path
++
++import numpy as np
++
++from src.config import Config, DQNConfig, EnvConfig, load_config
++from src.environment import procgen as G
++from src.environment import terrain as T
++from src.environment.advanced_env import FEATURES, ExploredMap
++from src.evaluation.evaluator import make_env
++from src.evaluation.harness import ROW_FIELDS, evaluate_method
++from src.policies.astar_battery import BatteryAwareAStar
++from src.policies.rule_shield import RuleShield
++
++ROOT = Path(__file__).resolve().parents[1]
++HAS_TORCH = importlib.util.find_spec("torch") is not None
++WIN0 = FEATURES.index("win_r-2_c-2")
++
++
++def cfg32(**kw):
++    base = dict(kind="advanced", size=32, battery=250, p_normal=.60, p_sand=.15, p_rock=.10)
++    base.update(kw)
++    return EnvConfig(**base)
++
++
++def quiet(**kw):
++    return cfg32(slip_prob=(0, 0, 0), sensor_miss=0.0, sensor_false=0.0, sensor_sigma=0.0, **kw)
++
++
++def flat(n=32, fill=T.NORMAL):
++    return np.full((n, n), fill, dtype=np.int64)
++
++
++def known_map(grid, bumped=None, visits=None) -> ExploredMap:
++    """Explored map of a world the rover has fully and perfectly sensed (test helper)."""
++    obs = grid == T.OBSTACLE
++    return ExploredMap(seen=np.ones(grid.shape, np.int64), obs_reads=obs.astype(np.int64),
++                       terrain_sum=np.where(obs, 0.0, T.PATCH_VALUE[np.minimum(grid, 2)]),
++                       visits=np.zeros(grid.shape, np.int64) if visits is None else visits,
++                       bumped=np.zeros(grid.shape, bool) if bumped is None else bumped)
++
++
++def blank_map(n=32) -> ExploredMap:
++    z = lambda dt: np.zeros((n, n), dtype=dt)  # noqa: E731
++    return ExploredMap(z(np.int64), z(np.int64), z(float), z(np.int64), z(bool))
++
++
++def fake_obs(pos, goal, battery_ratio=1.0, n=32, window=None):
++    o = np.zeros(len(FEATURES))
++    o[0], o[1] = pos[0] / (n - 1), pos[1] / (n - 1)
++    o[2], o[3] = (goal[0] - pos[0]) / (n - 1), (goal[1] - pos[1]) / (n - 1)
++    o[4] = battery_ratio
++    if window is not None:
++        o[WIN0:WIN0 + 25] = np.asarray(window).ravel()
++    return o
++
++
++def astar_on(m, **kw):
++    p = BatteryAwareAStar(**kw)
++    p.attach(lambda: m, 250)
++    return p
++
++
++class TestAStar(unittest.TestCase):
++    def test_matches_dijkstra_on_fully_known_maps(self):
++        lut, checked = G.energy_lut((1, 3, 5)), 0
++        for s in range(15):
++            g = G.generate_terrain(np.random.default_rng(s), 32, .55, .2, .1, 2)
++            G.clear_blocks(g, (0, 0), (31, 31))
++            best = G.dijkstra_lut(g, (0, 0), lut)[31, 31]
++            if best >= T.INF:
++                continue  # unreachable map: A* then crosses a soft wall (covered by test_believed_obstacle_is_a_soft_wall)
++            checked += 1
++            p = astar_on(known_map(g), visit_penalty=0.0)
++            p.act(fake_obs((0, 0), (31, 31)))
++            self.assertEqual(p.last_plan["energy_est"], float(best), f"map {s}")
++            self.assertEqual(p.last_plan["n_unknown"], 0)
++        self.assertGreaterEqual(checked, 10)
++
++    def test_goes_through_the_gap(self):
++        g = flat(); g[10, :] = T.OBSTACLE; g[10, 20] = T.NORMAL
++        p = astar_on(known_map(g), visit_penalty=0.0)
++        p.act(fake_obs((0, 0), (31, 31)))
++        self.assertIn((10, 20), p.last_plan["path"])
++
++    def test_energy_not_distance(self):
++        """A longer all-normal detour (cost 6) beats a short sand shortcut (cost 9): battery-aware means energy-aware."""
++        g = flat(8); g[1:3, 1:3] = T.SAND
++        g[0, 3] = g[1, 3] = T.NORMAL
++        m = known_map(g)
++        p = astar_on(m, visit_penalty=0.0)
++        p.act(fake_obs((0, 0), (3, 3), n=8))
++        self.assertEqual(p.last_plan["energy_est"], 6.0)
++        self.assertTrue(all(g[c] == T.NORMAL for c in p.last_plan["path"][1:]))
++
++    def test_unknown_cells_have_explicit_and_battery_dependent_risk_cost(self):
++        m = blank_map()
++        p = astar_on(m)
++        p.act(fake_obs((0, 0), (5, 5), battery_ratio=1.0))
++        full = p.last_plan
++        self.assertEqual(full["n_unknown"], 10)
++        self.assertEqual(full["energy_est"], 10 * p.unknown_energy)
++        self.assertGreater(full["cost"], full["energy_est"])           # the risk premium is in the planning cost
++        p.act(fake_obs((0, 0), (5, 5), battery_ratio=0.2))
++        self.assertGreater(p.last_plan["cost"], full["cost"])           # and grows as the battery drains
++
++    def test_bumped_cell_is_a_hard_wall_even_if_sensor_says_free(self):
++        bumped = np.zeros((32, 32), bool); bumped[1, 0] = True
++        p = astar_on(known_map(flat(), bumped=bumped), visit_penalty=0.0)
++        a = p.act(fake_obs((0, 0), (2, 0)))
++        self.assertNotIn((1, 0), p.last_plan["path"])
++        self.assertEqual(a, 3)  # sidesteps right
++
++    def test_believed_obstacle_is_a_soft_wall(self):
++        g = flat(); g[0, :] = T.OBSTACLE; g[1, :] = T.OBSTACLE  # corridor fully closed by believed obstacles
++        p = astar_on(known_map(g))
++        p.act(fake_obs((0, 0), (31, 31)))
++        self.assertIsNotNone(p.last_plan["path"])                      # never deadlocks on possibly-false detections
++        self.assertGreaterEqual(p.last_plan["cost"], p.obstacle_penalty)
++
++    def test_visit_penalty_discourages_going_back(self):
++        v = np.zeros((32, 32), np.int64); v[5, 4] = 3
++        p = astar_on(known_map(flat(), visits=v), visit_penalty=0.3)
++        a = p.act(fake_obs((5, 5), (5, 0)))   # goal to the left; the cell on the left was visited, but is still the only direct way
++        self.assertIn(a, (0, 1, 2))           # may sidestep; must never return an invalid action
++        self.assertIn(a, range(4))
++
++    def test_requires_attach_and_valid_costs(self):
++        with self.assertRaises(RuntimeError):
++            BatteryAwareAStar().act(fake_obs((0, 0), (1, 1)))
++        with self.assertRaises(ValueError):
++            BatteryAwareAStar(unknown_energy=0.5)
++
++    def test_closed_loop_flat_world_is_optimal(self):
++        env, ev = make_env(quiet(), 0)
++        obs = ev.reset_with_map(flat(), start=(0, 0))
++        p = BatteryAwareAStar()
++        p.attach(env.explored_map, env.max_battery)
++        done, info, energy = False, {}, 0
++        while not done:
++            obs, _, done, info = env.step(p.act(obs))
++            energy += info["energy_used"]
++        self.assertEqual((info["reason"], energy, info["steps"]), ("goal", 62, 62))
++
++    def test_policy_module_is_onboard_only(self):
++        for f in ("astar_battery.py", "rule_shield.py"):
++            tree = ast.parse((ROOT / "src/policies" / f).read_text())
++            mods = [n.module or "" for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)] + \
++                   [a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names]
++            for m in mods:
++                self.assertFalse(m.startswith("src.evaluation") or m.endswith("procgen") or m.endswith("terrain"), f"{f}: {m}")
++
++    def test_reaches_goal_on_generated_maps_with_noisy_sensor_and_slip(self):
++        env, ev = make_env(load_config(ROOT / "configs/sim32_id.yaml").env, 0)
++        p = BatteryAwareAStar()
++        _, s = evaluate_method(p, ROOT / "configs/sim32_id.yaml", range(20000, 20012), "astar", "id")
++        self.assertGreaterEqual(s["success_rate"], 0.9)
++
++
++class Fixed:
++    def __init__(self, a, q=None):
++        self.a, self.q = a, q
++
++    def act(self, obs):
++        return self.a
++
++    def q_values(self, obs):
++        if self.q is None:
++            raise AttributeError
++        return self.q
++
++
++class FixedNoQ:
++    def __init__(self, a):
++        self.a = a
++
++    def act(self, obs):
++        return self.a
++
++
++def shield_world(grid, start, base, **cfgkw):
++    env, ev = make_env(quiet(**cfgkw) if cfgkw else quiet(), 0)
++    obs = ev.reset_with_map(grid, start=start)
++    sh = RuleShield(base)
++    sh.attach(env.explored_map, env.max_battery)
++    return env, ev, sh, obs
++
++
++class TestRuleShield(unittest.TestCase):
++    def test_invalid_action_off_map(self):
++        env, ev, sh, obs = shield_world(flat(), (0, 0), FixedNoQ(0))   # up from the top-left corner
++        self.assertEqual(sh.violations(obs, 0, env.explored_map()), ["invalid_action"])
++        a = sh.act(obs)
++        self.assertNotEqual(a, 0)
++        self.assertEqual((sh.stats["interventions"], dict(sh.stats["by_rule"])), (1, {"invalid_action": 1}))
++
++    def test_obstacle_in_window_is_rejected_and_best_q_alternative_chosen(self):
++        g = flat(); g[10, 11] = T.OBSTACLE
++        q = np.array([0.0, 0.1, 0.2, 5.0])           # base wants "right" (3) into the obstacle
++        env, ev, sh, obs = shield_world(g, (10, 10), Fixed(3, q))
++        a = sh.act(obs)
++        self.assertEqual(a, 2)                       # best-Q among the SAFE actions (left), not the obstacle action
++        self.assertEqual(sh.last_decision["violations"], ["obstacle"])
++
++    def test_collision_memory_rejects_cell_the_sensor_missed(self):
++        g = flat(); g[10, 11] = T.OBSTACLE
++        env, ev = make_env(cfg32(slip_prob=(0, 0, 0), sensor_miss=1.0, sensor_false=0.0, sensor_sigma=0.0), 0)
++        obs = ev.reset_with_map(g, start=(10, 10))
++        sh = RuleShield(FixedNoQ(3)); sh.attach(env.explored_map, env.max_battery)
++        self.assertEqual(sh.violations(obs, 3, env.explored_map()), [])       # sensor missed it: allowed
++        obs, *_ = env.step(3)                                                 # bump
++        self.assertEqual(sh.violations(obs, 3, env.explored_map()), ["obstacle"])
++
++    def test_battery_rule(self):
++        g = flat(); g[10, 11] = T.SAND
++        env, ev, sh, obs = shield_world(g, (10, 10), FixedNoQ(3))
++        env.battery = 3                                                       # entry 3 <= 3 but cannot reach the goal
++        obs = env._observe()
++        self.assertIn("battery", sh.violations(obs, 3, env.explored_map()))
++        env.battery = 250
++        self.assertEqual(sh.violations(env._observe(), 3, env.explored_map()), [])
++
++    def test_safe_action_passes_through_untouched(self):
++        env, ev, sh, obs = shield_world(flat(), (10, 10), FixedNoQ(1))
++        self.assertEqual(sh.act(obs), 1)
++        self.assertEqual((sh.stats["decisions"], sh.stats["interventions"]), (1, 0))
++
++    def test_no_safe_action_keeps_base_action_and_counts_it(self):
++        g = flat(); g[0, 1] = g[1, 0] = T.OBSTACLE           # rover walled into the corner (0,0): up/left off-map
++        env, ev, sh, obs = shield_world(g, (0, 0), FixedNoQ(3))
++        self.assertEqual(sh.act(obs), 3)
++        self.assertEqual(sh.stats["no_safe_action"], 1)
++
++    def test_shield_never_passes_a_detected_obstacle(self):
++        rng = np.random.default_rng(0)
++        for _ in range(40):
++            g = G.generate_terrain(rng, 32, .5, .2, .1, 1); G.clear_blocks(g, (0, 0), (31, 31))
++            pos = (int(rng.integers(3, 29)), int(rng.integers(3, 29))); g[pos] = T.NORMAL
++            env, ev, sh, obs = shield_world(g, pos, Fixed(int(rng.integers(4)), rng.normal(size=4)))
++            a = sh.act(obs)
++            dr, dc = T.DELTAS[a]
++            if not sh.last_decision.get("no_safe_action"):
++                self.assertNotEqual(g[pos[0] + dr, pos[1] + dc], T.OBSTACLE)
++
++    def test_requires_attach(self):
++        with self.assertRaises(RuntimeError):
++            RuleShield(FixedNoQ(0)).act(fake_obs((0, 0), (1, 1)))
++
++    def test_shield_reduces_attempted_unsafe_actions(self):
++        from src.policies.sim32_heuristic import ReactiveExplorer
++        cfgp = ROOT / "configs/sim32_id.yaml"
++        _, plain = evaluate_method(ReactiveExplorer(0), cfgp, range(20000, 20015), "r", "id")
++        sh = RuleShield(ReactiveExplorer(0))
++        _, shielded = evaluate_method(sh, cfgp, range(20000, 20015), "rs", "id")
++        self.assertLess(shielded["attempted_unsafe_per_episode"], plain["attempted_unsafe_per_episode"])
++        self.assertGreater(shielded["intervention_rate"], 0)
++
++
++class TestHarness(unittest.TestCase):
++    CFG = ROOT / "configs/sim32_id.yaml"
++
++    def test_all_methods_get_identical_maps_and_rows_are_consistent(self):
++        from src.policies.baseline_policies import RandomPolicy
++        seeds = range(20000, 20004)
++        ra, _ = evaluate_method(BatteryAwareAStar(), self.CFG, seeds, "astar", "id")
++        rb, _ = evaluate_method(RandomPolicy(0), self.CFG, seeds, "random", "id")
++        self.assertEqual([r["map"] for r in ra], [r["map"] for r in rb])
++        self.assertEqual([r["optimal_cost"] for r in ra], [r["optimal_cost"] for r in rb])
++        for r in ra + rb:
++            self.assertEqual(r["success"], int(r["reason"] == "goal"))
++            self.assertLessEqual(r["attempted_unsafe"], r["steps"])
++            self.assertGreaterEqual(r["battery_left"], 0)
++
++    def test_deterministic(self):
++        a, _ = evaluate_method(BatteryAwareAStar(), self.CFG, range(20000, 20005), "a", "id")
++        b, _ = evaluate_method(BatteryAwareAStar(), self.CFG, range(20000, 20005), "a", "id")
++        for x, y in zip(a, b):
++            x, y = dict(x), dict(y)
++            x.pop("plan_ms"); y.pop("plan_ms")
++            self.assertEqual(x, y)
++
++    def test_csv_has_documented_columns(self):
++        with tempfile.TemporaryDirectory() as d:
++            evaluate_method(BatteryAwareAStar(), self.CFG, range(20000, 20002), "a", "id", Path(d) / "x.csv")
++            with open(Path(d) / "x.csv") as f:
++                rows = list(csv.DictReader(f))
++        self.assertEqual(list(rows[0].keys()), ROW_FIELDS)
++        self.assertEqual(len(rows), 2)
++
++    def test_attempted_unsafe_is_judged_from_ground_truth_on_the_commanded_move(self):
++        env, ev = make_env(quiet(), 0)
++        g = flat(); g[10, 11] = T.OBSTACLE
++        ev.reset_with_map(g, start=(10, 10))
++        self.assertTrue(ev.commanded_cell_unsafe(3))     # into the obstacle
++        self.assertFalse(ev.commanded_cell_unsafe(1))
++        ev.reset_with_map(flat(), start=(0, 0))
++        self.assertTrue(ev.commanded_cell_unsafe(0))     # off the map
++
++
++@unittest.skipUnless(HAS_TORCH, "torch not installed")
++class TestDQNChecks(unittest.TestCase):
++    def _agent(self, **kw):
++        from src.agents.dqn_agent import DQNAgent
++        env, ev = make_env(cfg32(), 0)
++        cfg = replace(DQNConfig(), **kw)
++        return DQNAgent(env.obs_dim, env.n_actions, cfg, seed=0), env, ev
++
++    def test_replay_buffer_contents_match_the_transitions_and_terminated_flag(self):
++        agent, env, ev = self._agent(buffer_size=1000, batch_size=16)
++        env2, _ = make_env(cfg32(max_steps=5, slip_prob=(0, 0, 0)), 0)        # episodes end by TIMEOUT (truncated)
++        rng, rec, obs = np.random.default_rng(0), [], env2.reset(seed=3)
++        for _ in range(40):
++            a = int(rng.integers(4))
++            obs2, r, done, info = env2.step(a)
++            agent.remember(obs, a, r, obs2, info["terminated"])
++            rec.append((obs.astype(np.float32).tobytes(), a, round(float(r), 4), obs2.astype(np.float32).tobytes(), float(info["terminated"])))
++            obs = env2.reset() if done else obs2
++        self.assertEqual(len(agent.buffer), 40)
++        s, a, r, s2, d = agent.buffer.sample(300)
++        self.assertEqual(s.shape, (300, env.obs_dim))
++        known = set(rec)
++        for i in range(300):
++            self.assertIn((s[i].astype(np.float32).tobytes(), int(a[i]), round(float(r[i]), 4), s2[i].astype(np.float32).tobytes(), float(d[i])), known)
++        self.assertEqual(float(np.max(d)), 0.0)   # every episode here was truncated, never terminated -> bootstrap must continue
++
++    def test_target_network_updates_every_n_learn_steps(self):
++        import torch
++        agent, env, ev = self._agent(buffer_size=500, batch_size=8, target_update_freq=5, warmup_steps=0)
++        rng, obs = np.random.default_rng(1), env.reset(seed=1)
++        for _ in range(40):
++            a = int(rng.integers(4)); obs2, r, done, info = env.step(a)
++            agent.remember(obs, a, r, obs2, info["terminated"]); obs = env.reset() if done else obs2
++        same = lambda: all(torch.equal(p, q) for p, q in zip(agent.model.parameters(), agent.target.parameters()))  # noqa: E731
++        self.assertTrue(same())
++        for k in range(1, 5):
++            agent.learn()
++            self.assertFalse(same(), f"target changed early at step {k}")
++        agent.learn()                                                          # 5th learn step -> sync
++        self.assertTrue(same())
++
++    def test_exploration_schedule(self):
++        agent, env, _ = self._agent()
++        self.assertEqual(agent.epsilon, DQNConfig().eps_start)
++        for _ in range(2000):
++            agent.decay_epsilon()
++        c = DQNConfig()
++        self.assertTrue(c.eps_min * c.eps_decay <= agent.epsilon <= c.eps_min + 1e-12)
++        agent.epsilon = 1.0
++        obs = env.reset(seed=2)
++        self.assertEqual({agent.act(obs) for _ in range(200)}, {0, 1, 2, 3})   # fully random when epsilon = 1
++        self.assertEqual(len({agent.act(obs, greedy=True) for _ in range(50)}), 1)  # greedy ignores epsilon
++        self.assertEqual(agent.act(obs, greedy=True), int(np.argmax(agent.q_values(obs))))
++
++    def test_checkpoint_roundtrip(self):
++        agent, env, _ = self._agent()
++        agent.epsilon = 0.37
++        obs = env.reset(seed=4)
++        with tempfile.TemporaryDirectory() as d:
++            agent.save(Path(d) / "c.pt")
++            other, _, _ = self._agent()
++            other.load(Path(d) / "c.pt")
++        np.testing.assert_allclose(agent.q_values(obs), other.q_values(obs))
++        self.assertEqual(other.epsilon, 0.37)
++
++    def test_reward_calculation(self):
++        env, ev = make_env(quiet(), 0)
++        g = flat(); g[6, 5] = T.NORMAL; g[5, 6] = T.SAND; g[4, 5] = T.ROCK
++        ev.reset_with_map(g, start=(5, 5))
++        self.assertAlmostEqual(env.step(1)[1], 0.5 - 0.05)                     # toward goal, normal
++        ev.reset_with_map(g, start=(5, 5))
++        self.assertAlmostEqual(env.step(3)[1], 0.5 - 0.05 - 0.05)              # toward goal, sand (energy 3)
++        ev.reset_with_map(g, start=(5, 5))
++        self.assertAlmostEqual(env.step(0)[1], -0.5 - 0.05 - 0.10)             # away from goal, rock (energy 5)
++
++    def test_training_loop_saves_best_val_and_final_checkpoints(self):
++        from src.agents.dqn_agent import DQNAgent
++        from src.training.loops import train_dqn
++        cfg = Config(env=cfg32(), dqn=replace(DQNConfig(), warmup_steps=50, buffer_size=2000),
++                     run=replace(Config().run, episodes=4, eval_every=2, eval_episodes=2))
++        env, _ = make_env(cfg.env, 0)
++        agent = DQNAgent(env.obs_dim, env.n_actions, cfg.dqn, seed=0)
++        with tempfile.TemporaryDirectory() as d:
++            s = train_dqn(agent, cfg, d)
++            self.assertTrue((Path(d) / "checkpoints/best_val.pt").exists())
++            self.assertTrue((Path(d) / "checkpoints/final.pt").exists())
++            self.assertEqual(len((Path(d) / "eval_greedy_val.csv").read_text().strip().splitlines()) - 1, 2)
++        self.assertEqual(s["greedy_test_200"]["episodes"], 200)
++
++
++if __name__ == "__main__":
++    unittest.main()

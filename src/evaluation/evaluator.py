@@ -80,6 +80,14 @@ class AdvancedEvaluator(Evaluator):
         e._install_world(grid, start, goal, int(min(dist, T.INF)), map_id)
         return e._observe()
 
+    def commanded_cell_unsafe(self, action: int) -> bool:
+        """True if the COMMANDED move (before any slip) targets an obstacle or leaves the map. Scoring only."""
+        e = self._env
+        x, y = e.position
+        dx, dy = T.DELTAS[int(action)]
+        nx, ny = x + dx, y + dy
+        return not (0 <= nx < e.size and 0 <= ny < e.size) or bool(e._world.grid[nx, ny] == T.OBSTACLE)
+
     @property
     def true_slip(self):
         return self._env._slip

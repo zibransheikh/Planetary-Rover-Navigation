@@ -56,6 +56,12 @@ class PPOAgent:
         return int(logits.argmax(-1).item()) if greedy else int(Categorical(logits=logits).sample().item())
 
     @torch.no_grad()
+    def q_values(self, obs) -> np.ndarray:
+        """Action preferences (policy logits). Same name as DQN's so `RuleShield` can pick the best SAFE action."""
+        logits, _ = self.model(torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0))
+        return logits.squeeze(0).numpy()
+
+    @torch.no_grad()
     def policy_stats(self, obs) -> tuple[float, float]:
         """(entropy in nats, max action probability) of the policy at `obs`; used by scripts/diagnose_ppo.py."""
         logits, _ = self.model(torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0))

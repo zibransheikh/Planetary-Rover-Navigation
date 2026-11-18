@@ -1,0 +1,13 @@
+diff --git a/scripts/run_task3.py b/scripts/run_task3.py
+index adbd329..2fe3e70 100644
+--- a/scripts/run_task3.py
++++ b/scripts/run_task3.py
+@@ -161,7 +161,7 @@ def cmd_report(a):
+                 lo_, hi_ = max(0.0, m - h), min(1.0, m + h)  # clipped to [0,1]
+                 sr_txt, ci_txt, n_txt = f"{m:.3f} ± {sd:.3f}", f"[{lo_:.3f}, {hi_:.3f}] (t over {len(srs)} seeds)", f"{len(srs)}x{len(per_seed[0])}"
+             dec = sum(int(r["decisions"]) for r in allr)
+-            interv = f"{sum(int(r['interventions']) for r in allr) / dec:.3f}" if kind == "dqn_shield" and dec else "—"
++            interv = f"{sum(int(r['interventions']) for r in allr) / dec:.3f}" if kind.endswith("_shield") and dec else "—"
+             row = [kind, sr_txt, ci_txt, n_txt, f"{_mean_of(allr, 'collisions'):.2f}", f"{_mean_of(allr, 'attempted_unsafe'):.2f}",
+                    f"{_mean_of(allr, 'energy_ratio', True):.2f}", f"{_mean_of(allr, 'battery_left', True):.0f}", f"{_mean_of(allr, 'steps'):.0f}", interv]
+             lines.append("| " + " | ".join(row) + " |")
