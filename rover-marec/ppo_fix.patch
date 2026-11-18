@@ -1,0 +1,174 @@
+diff --git a/scripts/diagnose_ppo.py b/scripts/diagnose_ppo.py
+new file mode 100644
+index 0000000..e3c5a02
+--- /dev/null
++++ b/scripts/diagnose_ppo.py
+@@ -0,0 +1,48 @@
++"""Diagnose greedy-vs-sampled PPO.
++   python scripts/diagnose_ppo.py --config configs/baseline_10x10_onboard.yaml --ckpt results/ref_onboard_ppo_s0/checkpoints/final.pt
++Runs the same validation maps in both modes and prints success, end reasons, collisions/episode and the policy's
++mean entropy / max-probability along the visited states."""
++from _common import ROOT  # noqa: F401
++
++import argparse
++
++import numpy as np
++import torch
++
++from src.agents.ppo_agent import PPOAgent
++from src.config import load_config
++from src.evaluation.evaluator import make_env
++from src.evaluation.runner import evaluate
++from src.seeding import seed_everything
++
++ap = argparse.ArgumentParser()
++ap.add_argument("--config", required=True)
++ap.add_argument("--ckpt", required=True)
++ap.add_argument("--n", type=int, default=200)
++args = ap.parse_args()
++
++cfg = load_config(ROOT / args.config)
++seed_everything(cfg.run.seed)
++env, ev = make_env(cfg.env, seed=cfg.run.seed)
++agent = PPOAgent(env.obs_dim, env.n_actions, cfg.ppo, seed=cfg.run.seed)
++agent.load(args.ckpt)
++seeds = range(cfg.run.val_seed_offset, cfg.run.val_seed_offset + args.n)
++
++
++class Probe:
++    def __init__(self, greedy):
++        self.greedy, self.ent, self.pmax = greedy, [], []
++
++    def act(self, obs):
++        e, p = agent.policy_stats(obs)
++        self.ent.append(e); self.pmax.append(p)
++        return agent.act(obs, greedy=self.greedy)
++
++
++print(f"{'mode':8} {'SR':>5} {'goal':>5} {'batt':>5} {'tmo':>4} {'coll/ep':>8} {'steps':>6} {'entropy':>8} {'pmax':>6}  (max entropy = {np.log(env.n_actions):.2f})")
++for name, greedy in (("greedy", True), ("sampled", False)):
++    pr = Probe(greedy)
++    _, s = evaluate(env, ev, pr, seeds)
++    r = s["reasons"]
++    print(f"{name:8} {s['success_rate']:5.2f} {r['goal']:5d} {r['battery_depleted']:5d} {r['timeout']:4d} "
++          f"{s['collisions_per_episode']:8.2f} {s['mean_steps']:6.1f} {np.mean(pr.ent):8.2f} {np.mean(pr.pmax):6.2f}")
+diff --git a/src/agents/ppo_agent.py b/src/agents/ppo_agent.py
+index fdfe7fc..004f5f0 100644
+--- a/src/agents/ppo_agent.py
++++ b/src/agents/ppo_agent.py
+@@ -55,6 +55,13 @@ class PPOAgent:
+         logits, _ = self.model(torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0))
+         return int(logits.argmax(-1).item()) if greedy else int(Categorical(logits=logits).sample().item())
+ 
++    @torch.no_grad()
++    def policy_stats(self, obs) -> tuple[float, float]:
++        """(entropy in nats, max action probability) of the policy at `obs`; used by scripts/diagnose_ppo.py."""
++        logits, _ = self.model(torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0))
++        dist = Categorical(logits=logits)
++        return float(dist.entropy().item()), float(dist.probs.max().item())
++
+     @torch.no_grad()
+     def value(self, obs) -> float:
+         return float(self.model(torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0))[1].item())
+@@ -68,7 +75,7 @@ class PPOAgent:
+         gae, returns = 0.0, [0.0] * len(self.rewards)
+         for t in reversed(range(len(self.rewards))):
+             nonterminal = 1.0 - self.dones[t]
+-            delta = self.rewards[t] + c.gamma * vals[t + 1] * nonterminal - vals[t]
++            delta = c.reward_scale * self.rewards[t] + c.gamma * vals[t + 1] * nonterminal - vals[t]
+             gae = delta + c.gamma * c.lam * nonterminal * gae
+             returns[t] = gae + vals[t]
+         returns = np.asarray(returns, dtype=np.float32)
+diff --git a/src/config.py b/src/config.py
+index 3efa15e..94c6374 100644
+--- a/src/config.py
++++ b/src/config.py
+@@ -54,6 +54,10 @@ class PPOConfig:
+     rollout_steps: int = 512
+     grad_clip: float = 0.5
+     hidden: tuple[int, ...] = (256, 256)
++    # Rewards are multiplied by this inside GAE only (env reward is untouched). Episode returns reach ~100-150
++    # (goal bonus), so the unscaled critic loss dominates the shared trunk and the clipped gradient norm.
++    # 1.0 = original behaviour; 0.02 puts returns near O(1-3).
++    reward_scale: float = 1.0
+ 
+ 
+ @dataclass
+diff --git a/src/training/loops.py b/src/training/loops.py
+index 8c2fb19..ecdb144 100644
+--- a/src/training/loops.py
++++ b/src/training/loops.py
+@@ -30,6 +30,15 @@ class _Greedy:
+         return self.agent.act(obs, greedy=True)
+ 
+ 
++class _Sampled:
++    """Stochastic evaluation of a PPO-like agent (draws from the policy instead of argmax)."""
++    def __init__(self, agent):
++        self.agent = agent
++
++    def act(self, obs):
++        return self.agent.act(obs, greedy=False)
++
++
+ class _Writers:
+     def __init__(self, out_dir: Path):
+         out_dir.mkdir(parents=True, exist_ok=True)
+@@ -56,11 +65,16 @@ def _finish(agent, cfg: Config, out_dir: Path, w: _Writers, success, battery, t0
+     w.close()
+     val = _eval(agent, cfg, eval_env, eval_ev, cfg.run.val_seed_offset, 200)
+     test = _eval(agent, cfg, eval_env, eval_ev, cfg.run.test_seed_offset, 200)
++    # PPO-like agents: also report the sampled policy on the same maps (after the greedy runs, so greedy numbers
++    # and RNG streams are unchanged). A large greedy-vs-sampled gap means the argmax policy is not the trained one.
++    sampled = ({"sampled_val_200": evaluate(eval_env, eval_ev, _Sampled(agent), range(cfg.run.val_seed_offset, cfg.run.val_seed_offset + 200))[1],
++                "sampled_test_200": evaluate(eval_env, eval_ev, _Sampled(agent), range(cfg.run.test_seed_offset, cfg.run.test_seed_offset + 200))[1]}
++               if hasattr(agent, "sample") else {})
+     summary = {
+         "episodes": len(success), "env_steps": n_steps, "wall_seconds": round(time.time() - t0, 1),
+         "train_time_SR_last100": float(np.mean(success[-100:])), "train_time_battery_last100": float(np.mean(battery[-100:])),
+         "train_time_min_battery": int(min(battery)),
+-        "greedy_val_200": val, "greedy_test_200": test,
++        "greedy_val_200": val, "greedy_test_200": test, **sampled,
+         "note": "train_time_* include exploration (DQN eps>=eps_min, PPO sampling); greedy_* are the deployable policy",
+     }
+     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=float))
+diff --git a/tests/test_ppo_fixes.py b/tests/test_ppo_fixes.py
+new file mode 100644
+index 0000000..232412f
+--- /dev/null
++++ b/tests/test_ppo_fixes.py
+@@ -0,0 +1,34 @@
++import unittest
++
++import torch
++
++from src.agents.ppo_agent import PPOAgent
++from src.config import PPOConfig
++
++
++class TestPPOFixes(unittest.TestCase):
++    def _agent(self, scale):
++        return PPOAgent(4, 4, PPOConfig(reward_scale=scale, hidden=(8,)), seed=0)
++
++    def test_reward_scale_scales_returns(self):
++        outs = []
++        for scale in (1.0, 0.02):
++            a = self._agent(scale)
++            for t in range(5):  # zero critic values -> returns are pure scaled discounted rewards
++                a.store([0.0] * 4, 0, 0.0, 100.0 if t == 4 else -0.05, 0.0, t == 4)
++            outs.append(a._gae(0.0)[0])
++        self.assertTrue(torch.allclose(torch.as_tensor(outs[1]), torch.as_tensor(outs[0]) * 0.02, atol=1e-5))
++
++    def test_policy_stats_uniform(self):
++        a = self._agent(1.0)
++        torch.nn.init.zeros_(a.model.actor.weight); torch.nn.init.zeros_(a.model.actor.bias)
++        ent, pmax = a.policy_stats([0.0] * 4)
++        self.assertAlmostEqual(ent, float(torch.log(torch.tensor(4.0))), places=5)
++        self.assertAlmostEqual(pmax, 0.25, places=5)
++
++    def test_default_scale_is_original_behaviour(self):
++        self.assertEqual(PPOConfig().reward_scale, 1.0)
++
++
++if __name__ == "__main__":
++    unittest.main()

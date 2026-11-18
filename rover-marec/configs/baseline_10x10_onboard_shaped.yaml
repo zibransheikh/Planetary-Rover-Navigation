@@ -1,0 +1,5 @@
+# Leak-free observation, but keeps the original per-step budget-margin reward shaping
+# (uses full-map Dijkstra in the REWARD only; policy never sees it). Use to test whether
+# shaping is needed to reproduce original learning quality.
+env: {size: 10, battery: 100, obs_mode: onboard, reward_privileged_shaping: true}
+run: {seed: 0, episodes: 1500, out_dir: results/ref_onboard_shaped}

@@ -1,0 +1,16 @@
+# Task 2 preset: dynamics shift: costlier sand/rock, 2.5-3x slip.
+# TRUE simulator parameters; the rover never sees them (see docs/OBSERVATION_SCHEMA_V2.md).
+env:
+  kind: advanced
+  size: 32
+  battery: 250
+  p_normal: 0.6
+  p_sand: 0.15
+  p_rock: 0.1
+  gen_corr: 2
+  energy_cost: [1, 4, 6]
+  slip_prob: [0.06, 0.25, 0.15]
+  sensor_miss: 0.05
+  sensor_false: 0.02
+  sensor_sigma: 0.05
+run: {seed: 0, episodes: 1500, out_dir: results/sim32_dynamics_shift}
