@@ -4,7 +4,7 @@ PY ?= python3
 setup:            ## one-time: virtualenv + deps
 	$(PY) -m venv .venv && .venv/bin/pip install -U pip && .venv/bin/pip install -r requirements.txt
 
-test:             ## 27 tests, ~10 s, torch not required
+test:             ## all unit tests, torch not required
 	$(PY) -m unittest discover -s tests -t .
 
 audit:            ## measure defects of the ORIGINAL code (torch not required)

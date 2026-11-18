@@ -4,3 +4,6 @@ __pycache__/
 .ipynb_checkpoints/
 results/**/checkpoints/
 results/**/*.pt
+
+# macOS
+.DS_Store

@@ -1,4 +1,0 @@
-# Original 17-d observation INCLUDING privileged features. Reproduction/ablation only.
-# Never use for any result that is presented as partially observable.
-env: {size: 10, battery: 100, obs_mode: legacy17, reward_privileged_shaping: true}
-run: {seed: 0, episodes: 1500, log_margin: true, out_dir: results/ref_legacy17}
