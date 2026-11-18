@@ -1,0 +1,6 @@
+# Core (needed for env, tests, audit, reference run)
+numpy>=1.26
+PyYAML>=6.0
+matplotlib>=3.8
+# Learning agents (needed only for scripts/train_dqn.py and scripts/train_ppo.py)
+torch>=2.2
